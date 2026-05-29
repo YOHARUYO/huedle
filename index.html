@@ -1,0 +1,383 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+<title>HUEDLE · 색 맞히기</title>
+<meta name="description" content="눈으로 RGB를 맞히는 색감 퍼즐 PoC" />
+<style>
+  html,body{margin:0;padding:0;background:#1b1c1f;min-height:100%;}
+  #root{min-height:100vh;}
+  .boot{color:#9b9da4;font-family:system-ui,sans-serif;display:grid;place-items:center;height:100vh;font-size:14px;}
+</style>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js" crossorigin></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js" crossorigin></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.26.4/babel.min.js" crossorigin></script>
+</head>
+<body>
+<div id="root"><div class="boot">불러오는 중…</div></div>
+<script type="text/babel" data-presets="react">
+const { useState } = React;
+
+
+
+/* ---------- color math ---------- */
+function hslToRgb(h, s, l) {
+  h /= 360; s /= 100; l /= 100;
+  let r, g, b;
+  if (s === 0) { r = g = b = l; }
+  else {
+    const k = (p, q, t) => { if (t < 0) t += 1; if (t > 1) t -= 1; if (t < 1 / 6) return p + (q - p) * 6 * t; if (t < 1 / 2) return q; if (t < 2 / 3) return p + (q - p) * (2 / 3 - t) * 6; return p; };
+    const q = l < 0.5 ? l * (1 + s) : l + s - l * s, p = 2 * l - q;
+    r = k(p, q, h + 1 / 3); g = k(p, q, h); b = k(p, q, h - 1 / 3);
+  }
+  return [Math.round(r * 255), Math.round(g * 255), Math.round(b * 255)];
+}
+const css = ([r, g, b]) => `rgb(${r},${g},${b})`;
+function dist(a, b) {
+  const rb = (a[0] + b[0]) / 2, dr = a[0] - b[0], dg = a[1] - b[1], db = a[2] - b[2];
+  return Math.sqrt((2 + rb / 256) * dr * dr + 4 * dg * dg + (2 + (255 - rb) / 256) * db * db);
+}
+const MAXD = dist([0, 0, 0], [255, 255, 255]);
+const accuracyF = (a, b) => Math.max(0, 100 * (1 - dist(a, b) / MAXD));
+const fmtAcc = (v) => (v >= 99 ? v.toFixed(1) : Math.round(v));
+function bandFor(err, precise) {
+  if (precise) return err === 0 ? "green" : err <= 8 ? "yellow" : "gray";
+  return err <= 6 ? "green" : err <= 20 ? "yellow" : "gray";
+}
+const BAND = { green: "#46c98a", yellow: "#e2b53e", gray: "#6f7178", emoji: { green: "🟩", yellow: "🟨", gray: "⬜" } };
+const MAX_TRIES = 10;
+
+function rand(n) { return Math.floor(Math.random() * n); }
+function genSolid(mode) {
+  const h = rand(360);
+  if (mode === "hard") {
+    const r = rand(3);
+    if (r === 0) return hslToRgb(h, 12 + rand(22), 35 + rand(30));
+    if (r === 1) return hslToRgb(h, 30 + rand(40), 14 + rand(16));
+    return hslToRgb(h, 22 + rand(28), 76 + rand(14));
+  }
+  return hslToRgb(h, 55 + rand(30), 42 + rand(22)); // easy / precise
+}
+function genGrad() {
+  const h1 = rand(360), h2 = (h1 + 80 + rand(200)) % 360;
+  return { a: hslToRgb(h1, 60 + rand(25), 45 + rand(18)), b: hslToRgb(h2, 60 + rand(25), 45 + rand(18)), angle: [45, 90, 135, 0][rand(4)] };
+}
+
+const MODES = { easy: "쉬움", hard: "어려움", precise: "정밀", grad: "그라데이션" };
+const CH = ["R", "G", "B"];
+
+function Huedle() {
+  const [mode, setMode] = useState("easy");
+  const [target, setTarget] = useState(() => genSolid("easy"));
+  const [grad, setGrad] = useState(null);
+  const [hint, setHint] = useState(false);
+  const isGrad = mode === "grad";
+  const isPrecise = mode === "precise";
+
+  const [g, setG] = useState([128, 128, 128]);
+  const [gA, setGA] = useState([128, 128, 128]);
+  const [gB, setGB] = useState([128, 128, 128]);
+  const [attempts, setAttempts] = useState([]);
+  const [status, setStatus] = useState("playing");
+  const [showModal, setShowModal] = useState(false);
+  const [reveal, setReveal] = useState(false);
+
+  function newPuzzle(m) {
+    setMode(m);
+    if (m === "grad") setGrad(genGrad());
+    else { setTarget(genSolid(m)); setGrad(null); }
+    setG([128, 128, 128]); setGA([128, 128, 128]); setGB([128, 128, 128]);
+    setAttempts([]); setStatus("playing"); setShowModal(false); setReveal(false);
+  }
+
+  function retry() {
+    // same target — just reset the round
+    setG([128, 128, 128]); setGA([128, 128, 128]); setGB([128, 128, 128]);
+    setAttempts([]); setStatus("playing"); setShowModal(false); setReveal(false);
+  }
+
+  function submit() {
+    if (status !== "playing") return;
+    let bands, acc, rec;
+    if (isGrad) {
+      const ba = gA.map((v, i) => bandFor(Math.abs(v - grad.a[i]), false));
+      const bb = gB.map((v, i) => bandFor(Math.abs(v - grad.b[i]), false));
+      bands = [...ba, ...bb];
+      acc = (accuracyF(gA, grad.a) + accuracyF(gB, grad.b)) / 2;
+      rec = { gA: [...gA], gB: [...gB], bands, acc };
+    } else {
+      bands = g.map((v, i) => bandFor(Math.abs(v - target[i]), isPrecise));
+      acc = accuracyF(g, target);
+      rec = { g: [...g], bands, acc };
+    }
+    const solved = bands.every((x) => x === "green");
+    const next = [...attempts, rec];
+    setAttempts(next);
+    if (solved) { setStatus("won"); setReveal(true); setTimeout(() => setShowModal(true), 650); }
+    else if (next.length >= MAX_TRIES) { setStatus("lost"); setReveal(true); setTimeout(() => setShowModal(true), 650); }
+  }
+
+  const best = attempts.reduce((m, a) => Math.max(m, a.acc), 0);
+  const targetStyle = isGrad && grad
+    ? { backgroundImage: `linear-gradient(${grad.angle}deg, ${css(grad.a)}, ${css(grad.b)})` }
+    : { background: css(target) };
+
+  // direction of submitted guess relative to answer: ▲ guess was too low (raise), ▼ too high (lower)
+  function arrows(guessVals, tgt) {
+    return guessVals.map((v, i) => (v < tgt[i] ? "▲" : v > tgt[i] ? "▼" : ""));
+  }
+
+  // fill the "my color" swatch fully (avoid inherited tile background-size)
+  function mineStyle() {
+    if (!attempts.length) return {};
+    if (isGrad) return { backgroundImage: `linear-gradient(${grad.angle}deg, ${css(attempts.at(-1).gA)}, ${css(attempts.at(-1).gB)})`, backgroundSize: "100% 100%", backgroundRepeat: "no-repeat" };
+    return { background: css(attempts.at(-1).g) };
+  }
+
+  return (
+    <div className="hd-root">
+      <style>{CSS}</style>
+      <div className="hd-wrap">
+        <header className="hd-head">
+          <div>
+            <h1>色 <span>HUEDLE</span></h1>
+            <p className="hd-tag">눈으로 RGB를 맞히는 퍼즐</p>
+          </div>
+          <div className="hd-tabs">
+            {Object.entries(MODES).map(([k, v]) => (
+              <button key={k} className={`hd-tab ${mode === k ? "on" : ""}`} onClick={() => newPuzzle(k)}>{v}</button>
+            ))}
+          </div>
+        </header>
+
+        <div className="hd-stage">
+          <div className="hd-swatch hd-target" style={targetStyle}>
+            <span className="hd-swatch-lbl">목표 색{isGrad ? ` · ${grad.angle}°` : ""}</span>
+          </div>
+          <div className="hd-vs">
+            <div className="hd-swatch hd-mine" style={mineStyle()}>
+              <span className="hd-swatch-lbl">{attempts.length ? `내 추측 · ${fmtAcc(attempts.at(-1).acc)}%` : "?"}</span>
+            </div>
+          </div>
+        </div>
+
+        <div className="hd-hintbar">
+          <span className={`hd-mode-note ${isPrecise ? "on" : ""}`}>
+            {isPrecise ? "정밀 모드 · 세 채널 모두 정확히 일치(±0)해야 정답" : `채널 오차 ±6 이내면 정답 · ${MAX_TRIES}번 기회`}
+          </span>
+          <button className={`hd-toggle ${hint ? "on" : ""}`} onClick={() => setHint((h) => !h)}>
+            <span className="hd-toggle-dot" /> 방향 힌트 {hint ? "ON" : "OFF"}
+          </button>
+        </div>
+
+        {!isGrad ? (
+          <SliderGroup vals={g} setVals={setG} disabled={status !== "playing"} reveal={reveal} target={target} />
+        ) : (
+          <div className="hd-gradgroups">
+            <div><div className="hd-gradlbl">색 A</div><SliderGroup vals={gA} setVals={setGA} disabled={status !== "playing"} reveal={reveal} target={grad.a} /></div>
+            <div><div className="hd-gradlbl">색 B</div><SliderGroup vals={gB} setVals={setGB} disabled={status !== "playing"} reveal={reveal} target={grad.b} /></div>
+          </div>
+        )}
+
+        <div className="hd-controls">
+          <button className="hd-btn hd-ghost" onClick={() => newPuzzle(mode)}>새 색</button>
+          {status === "playing" ? (
+            <button className="hd-btn hd-go" onClick={submit}>{`제출 · ${attempts.length}/${MAX_TRIES}`}</button>
+          ) : (
+            <button className="hd-btn hd-go" onClick={retry}>다시 도전</button>
+          )}
+        </div>
+
+        <div className="hd-history">
+          {Array.from({ length: MAX_TRIES }).map((_, r) => {
+            const a = attempts[r];
+            const ar = a ? (isGrad ? [...arrows(a.gA, grad.a), ...arrows(a.gB, grad.b)] : arrows(a.g, target)) : null;
+            const vals = a ? (isGrad ? [...a.gA, ...a.gB] : a.g) : null;
+            return (
+              <div key={r} className={`hd-hrow ${a ? "filled" : ""}`}>
+                {a ? (
+                  <>
+                    <div className="hd-hchip" style={isGrad
+                      ? { backgroundImage: `linear-gradient(${grad.angle}deg, ${css(a.gA)}, ${css(a.gB)})`, backgroundSize: "100% 100%" }
+                      : { background: css(a.g) }} />
+                    <div className="hd-bands">
+                      {a.bands.map((bd, i) => (
+                        <div key={i} className={`hd-bandcell ${isGrad && i === 3 ? "sep" : ""}`}>
+                          <span className="hd-band" style={{ background: BAND[bd] }}>
+                            {hint && ar[i] ? ar[i] : (isGrad ? CH[i % 3] : CH[i])}
+                          </span>
+                          <span className="hd-bandval">{vals[i]}</span>
+                        </div>
+                      ))}
+                    </div>
+                    <span className="hd-acc">{fmtAcc(a.acc)}%</span>
+                  </>
+                ) : <span className="hd-hempty">—</span>}
+              </div>
+            );
+          })}
+        </div>
+
+        <div className="hd-legend">
+          <span className="hd-leg"><i style={{ background: BAND.green }} />{isPrecise ? "정확히 일치 (±0)" : "거의 정확 (±6)"}</span>
+          <span className="hd-leg"><i style={{ background: BAND.yellow }} />{isPrecise ? "근접 (±8)" : "근접 (±20)"}</span>
+          <span className="hd-leg"><i style={{ background: BAND.gray }} />벗어남</span>
+        </div>
+        <p className="hd-tip">
+          {hint
+            ? "방향 힌트 ON: 제출한 뒤, 그 추측이 정답보다 낮았던 채널은 ▲(더 올리기), 높았던 채널은 ▼(더 내리기)로 표시돼요. 제출을 반복하며 ▲▼를 따라 좁혀가세요."
+            : "밴드는 높고 낮음을 알려주지 않아요. 색을 눈으로 보고 어느 쪽으로 고칠지 판단하세요. (방향 힌트를 켜면 제출 기록에 ▲▼로 표시됩니다)"}
+        </p>
+      </div>
+
+      {showModal && (
+        <div className="hd-modal-bg" onClick={() => setShowModal(false)}>
+          <div className="hd-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="hd-modal-sw" style={targetStyle} />
+            <h2>{status === "won" ? tier(best, attempts.length) : `${fmtAcc(best)}%`}</h2>
+            <p className="hd-modal-sub">
+              {status === "won"
+                ? `${attempts.length}번 만에 ${isPrecise ? "정확히" : "세 채널을 모두"} 맞췄어요!`
+                : `${MAX_TRIES}번 안에 다 맞추진 못했지만 최고 ${fmtAcc(best)}% 정확도예요.`}
+            </p>
+            <div className="hd-answer">
+              <span>정답</span>
+              {isGrad
+                ? <code>A {grad.a.join(", ")} · B {grad.b.join(", ")}</code>
+                : <code>rgb({target.join(", ")})</code>}
+            </div>
+            <div className="hd-share">
+              <div className="hd-share-t">HUEDLE · {MODES[mode]} {status === "won" ? `${attempts.length}/${MAX_TRIES}` : `X/${MAX_TRIES}`}</div>
+              {attempts.map((a, r) => (
+                <div key={r} className="hd-share-row">{a.bands.map((bd) => BAND.emoji[bd]).join("")}</div>
+              ))}
+            </div>
+            <div className="hd-modal-btns">
+              {status === "lost"
+                ? <button className="hd-btn hd-ghost" onClick={retry}>다시 도전</button>
+                : <button className="hd-btn hd-ghost" onClick={() => setShowModal(false)}>닫기</button>}
+              <button className="hd-btn hd-go" onClick={() => newPuzzle(mode)}>새 색</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function tier(acc, tries) {
+  if (tries <= 3) return "완벽한 눈!";
+  if (acc >= 96) return "색채 마스터";
+  return "해결!";
+}
+
+function SliderGroup({ vals, setVals, disabled, reveal, target }) {
+  const tracks = ["linear-gradient(90deg,#000,#ff3b30)", "linear-gradient(90deg,#000,#34c759)", "linear-gradient(90deg,#000,#3b6bff)"];
+  return (
+    <div className="hd-sliders">
+      {vals.map((v, i) => (
+        <div key={i} className="hd-slider">
+          <span className="hd-ch">{CH[i]}</span>
+          <input type="range" min="0" max="255" value={v} disabled={disabled}
+            onChange={(e) => { const n = [...vals]; n[i] = +e.target.value; setVals(n); }}
+            style={{ background: tracks[i] }} />
+          <span className="hd-val">{v}{reveal ? <em> /{target[i]}</em> : null}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+const CSS = `
+@import url('https://fonts.googleapis.com/css2?family=Familjen+Grotesk:wght@500;700&family=Spline+Sans+Mono:wght@400;600&family=Gowun+Dodum&display=swap');
+.hd-root{--bg:#1b1c1f;--surf:#26282c;--surf2:#2e3035;--line:rgba(255,255,255,.09);--ink:#ecedf0;--soft:#9b9da4;
+  font-family:'Gowun Dodum',sans-serif;color:var(--ink);
+  background:radial-gradient(900px 500px at 50% -10%,#26282d 0%,#1b1c1f 60%);min-height:100%;
+  padding:22px 14px 38px;display:flex;justify-content:center;background-attachment:fixed;}
+.hd-wrap{width:100%;max-width:460px;display:flex;flex-direction:column;gap:14px;}
+.hd-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;flex-wrap:wrap;}
+.hd-head h1{font-family:'Familjen Grotesk',sans-serif;font-weight:700;font-size:24px;margin:0;letter-spacing:.01em;}
+.hd-head h1 span{letter-spacing:.16em;font-size:21px;}
+.hd-tag{margin:3px 0 0;font-size:12px;color:var(--soft);}
+.hd-tabs{display:flex;gap:4px;background:var(--surf);padding:4px;border-radius:11px;border:1px solid var(--line);flex-wrap:wrap;}
+.hd-tab{font-family:'Gowun Dodum';font-size:12.5px;padding:7px 10px;border-radius:8px;border:none;background:transparent;color:var(--soft);cursor:pointer;transition:.14s;}
+.hd-tab:hover{color:var(--ink);}
+.hd-tab.on{background:var(--surf2);color:var(--ink);box-shadow:0 1px 4px rgba(0,0,0,.3);}
+
+.hd-stage{display:grid;grid-template-columns:1.6fr 1fr;gap:10px;}
+.hd-swatch{border-radius:16px;aspect-ratio:16/11;position:relative;border:1px solid var(--line);
+  box-shadow:inset 0 0 0 1px rgba(255,255,255,.04),0 8px 24px rgba(0,0,0,.35);display:flex;align-items:flex-end;}
+.hd-target{aspect-ratio:auto;}
+.hd-vs{display:flex;}
+.hd-mine{flex:1;background:repeating-conic-gradient(#34363b 0% 25%,#2a2c30 0% 50%) 50%/16px 16px;}
+.hd-swatch-lbl{font-family:'Spline Sans Mono',monospace;font-size:11px;letter-spacing:.03em;margin:9px 11px;
+  padding:3px 8px;border-radius:6px;background:rgba(0,0,0,.42);color:#fff;backdrop-filter:blur(2px);}
+
+.hd-hintbar{display:flex;align-items:center;justify-content:space-between;gap:10px;}
+.hd-mode-note{font-size:11.5px;color:var(--soft);line-height:1.4;}
+.hd-mode-note.on{color:#e2b53e;}
+.hd-toggle{display:flex;align-items:center;gap:7px;font-family:'Gowun Dodum';font-size:12px;color:var(--soft);
+  background:var(--surf);border:1px solid var(--line);border-radius:20px;padding:6px 12px;cursor:pointer;transition:.14s;white-space:nowrap;}
+.hd-toggle.on{color:var(--ink);border-color:#46c98a;}
+.hd-toggle-dot{width:9px;height:9px;border-radius:50%;background:var(--soft);transition:.14s;}
+.hd-toggle.on .hd-toggle-dot{background:#46c98a;box-shadow:0 0 8px #46c98a;}
+
+.hd-sliders{display:flex;flex-direction:column;gap:11px;background:var(--surf);border:1px solid var(--line);border-radius:14px;padding:15px 16px;}
+.hd-slider{display:flex;align-items:center;gap:12px;}
+.hd-ch{font-family:'Spline Sans Mono',monospace;font-weight:600;font-size:14px;width:16px;color:var(--ink);}
+.hd-slider input[type=range]{flex:1;-webkit-appearance:none;appearance:none;height:8px;border-radius:6px;outline:none;cursor:pointer;}
+.hd-slider input::-webkit-slider-thumb{-webkit-appearance:none;width:22px;height:22px;border-radius:50%;background:#fff;border:3px solid #1b1c1f;box-shadow:0 2px 6px rgba(0,0,0,.5);cursor:pointer;}
+.hd-slider input::-moz-range-thumb{width:18px;height:18px;border-radius:50%;background:#fff;border:3px solid #1b1c1f;cursor:pointer;}
+.hd-slider input:disabled{opacity:.6;}
+.hd-val{font-family:'Spline Sans Mono',monospace;font-size:13px;width:56px;text-align:right;color:var(--ink);}
+.hd-val em{color:var(--soft);font-style:normal;font-size:11px;}
+.hd-gradgroups{display:flex;flex-direction:column;gap:10px;}
+.hd-gradlbl{font-size:12px;color:var(--soft);margin:0 0 6px 2px;font-family:'Spline Sans Mono';letter-spacing:.05em;}
+
+.hd-controls{display:flex;gap:9px;}
+.hd-btn{font-family:'Gowun Dodum';font-size:14.5px;padding:13px 10px;border-radius:12px;cursor:pointer;border:1px solid var(--line);transition:.14s;}
+.hd-btn:active{transform:translateY(1px);}
+.hd-btn:disabled{opacity:.4;cursor:not-allowed;}
+.hd-ghost{flex:1;background:var(--surf);color:var(--ink);}
+.hd-ghost:hover{background:var(--surf2);}
+.hd-go{flex:1.8;background:#f0f1f4;color:#1b1c1f;border-color:#f0f1f4;font-weight:700;font-family:'Spline Sans Mono';letter-spacing:.02em;}
+.hd-go:not(:disabled):hover{box-shadow:0 6px 18px rgba(255,255,255,.14);}
+
+.hd-history{display:flex;flex-direction:column;gap:5px;}
+.hd-hrow{display:flex;align-items:center;gap:10px;min-height:44px;padding:6px 10px;border-radius:9px;background:var(--surf);border:1px solid var(--line);}
+.hd-hrow.filled{animation:fade .35s both;}
+@keyframes fade{from{opacity:0;transform:translateY(4px);}to{opacity:1;}}
+.hd-hchip{width:28px;height:28px;border-radius:7px;flex:none;border:1px solid var(--line);}
+.hd-bands{display:flex;gap:6px;flex:1;flex-wrap:wrap;align-items:flex-start;}
+.hd-bandcell{display:flex;flex-direction:column;align-items:center;gap:3px;}
+.hd-bandcell.sep{margin-left:6px;}
+.hd-band{width:23px;height:23px;border-radius:6px;display:grid;place-items:center;font-family:'Spline Sans Mono';font-size:11px;font-weight:600;color:rgba(0,0,0,.6);}
+.hd-bandval{font-family:'Spline Sans Mono';font-size:10px;color:var(--soft);line-height:1;}
+.hd-acc{font-family:'Spline Sans Mono';font-size:13px;color:var(--soft);width:48px;text-align:right;}
+.hd-hempty{color:rgba(155,157,164,.3);}
+
+.hd-legend{display:flex;flex-wrap:wrap;gap:8px 16px;padding:2px;}
+.hd-leg{display:flex;align-items:center;gap:7px;font-size:12px;color:var(--soft);}
+.hd-leg i{width:12px;height:12px;border-radius:3px;}
+.hd-tip{font-size:11.5px;color:var(--soft);line-height:1.55;margin:0;padding:0 2px;}
+
+.hd-modal-bg{position:fixed;inset:0;background:rgba(10,11,13,.66);backdrop-filter:blur(4px);display:grid;place-items:center;padding:20px;z-index:50;animation:fade .25s both;}
+.hd-modal{background:var(--surf);border:1px solid var(--line);border-radius:20px;padding:26px;max-width:350px;width:100%;text-align:center;box-shadow:0 28px 70px rgba(0,0,0,.6);animation:pop .3s cubic-bezier(.2,1.2,.4,1) both;}
+@keyframes pop{from{transform:scale(.9);opacity:0;}to{transform:none;opacity:1;}}
+.hd-modal-sw{height:70px;border-radius:14px;margin-bottom:16px;border:1px solid var(--line);}
+.hd-modal h2{font-family:'Familjen Grotesk';font-size:24px;margin:0 0 6px;}
+.hd-modal-sub{font-size:13px;color:var(--soft);margin:0 0 16px;line-height:1.55;}
+.hd-answer{display:flex;align-items:center;justify-content:center;gap:9px;margin-bottom:16px;font-size:12px;color:var(--soft);}
+.hd-answer code{font-family:'Spline Sans Mono';color:var(--ink);background:var(--bg);padding:5px 10px;border-radius:7px;font-size:12px;}
+.hd-share{background:var(--bg);border:1px solid var(--line);border-radius:12px;padding:13px;margin-bottom:16px;}
+.hd-share-t{font-family:'Spline Sans Mono';font-size:11.5px;color:var(--soft);margin-bottom:8px;letter-spacing:.03em;}
+.hd-share-row{font-size:18px;line-height:1.4;letter-spacing:2px;}
+.hd-modal-btns{display:flex;gap:9px;}
+`;
+
+
+ReactDOM.createRoot(document.getElementById("root")).render(<Huedle />);
+</script>
+</body>
+</html>
